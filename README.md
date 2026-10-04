@@ -39,7 +39,7 @@ flowchart TB
 ## Why an AnalysisTemplate, not just a Deployment
 
 A plain `Deployment` rollout has no idea whether the new version is
-actually healthy — it just replaces pods. The `AnalysisTemplate`
+actually healthy; it just replaces pods. The `AnalysisTemplate`
 (`apps/order-service/analysis-template.yaml`) queries Prometheus every 30s
 during the canary window and checks two SLIs against the same request
 metrics the observability stack already collects:
