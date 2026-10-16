@@ -1,0 +1,15 @@
+# Terraform state can hold provider credentials and sensitive resource
+# attributes in plain text. Keep it in a remote backend, never in Git.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+*.tfvars
+!example.tfvars
+
+# Python
+__pycache__/
+.pytest_cache/
+
+# Security scan output
+reports/

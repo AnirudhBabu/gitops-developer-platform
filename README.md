@@ -33,7 +33,9 @@ flowchart TB
 ├── gitops/                 # App-of-Apps root, tenant Applications, Kyverno policies
 ├── apps/order-service/     # Rollout, AnalysisTemplate, and Helm chart wrapping both
 ├── observability/          # Dashboards-as-code, alert rules
-└── scripts/                # Canary failure simulation
+├── policy/kubernetes/      # OPA/Rego workload security policies + unit tests
+├── .github/workflows/      # Shift-left security pipeline (security.yml)
+└── scripts/                # Canary failure simulation, pinned scanner installer
 ```
 
 ## Why an AnalysisTemplate, not just a Deployment
@@ -68,6 +70,75 @@ scale, not a contrived example.
   cluster-wide, before anything reaches ArgoCD's sync.
 - **OpenCost** attributes spend per namespace so the `staging` tenant's
   actual compute cost is visible, not just its resource quota.
+
+## Shift-left security pipeline
+
+`.github/workflows/security.yml` runs on every pull request, every push to
+`main` and weekly (new CVEs appear in code that has not changed). Any HIGH or
+CRITICAL finding, leaked secret or policy violation fails the build, so
+nothing insecure reaches the branch ArgoCD syncs from. Findings are uploaded
+as SARIF to the repository's Code scanning tab.
+
+| Job | Tooling | What it catches |
+|---|---|---|
+| `secrets` | gitleaks (full history) | Credentials committed at any point, not just in the latest commit |
+| `sast` | Semgrep (Python, secrets, GitHub Actions rules), pytest | Insecure code in the CLI; regression tests for its input validation |
+| `deps` | Trivy, pip-audit, CycloneDX SBOM | Vulnerable dependencies; an SBOM artifact on every run |
+| `iac` | Checkov, Trivy config | Terraform, Kubernetes, Helm and workflow misconfigurations |
+| `policy` | OPA / Conftest | Pod hardening on every workload kind, Argo Rollouts included |
+
+### Why custom OPA policies
+
+Generic scanners only recognise built-in workload kinds. Scanning the
+original `order-service` manifest, Trivy reported **7** findings when its
+`kind` was `Deployment` and **0** when it was `Rollout`, with an identical pod
+spec; Checkov inspected only the Service. Every workload on this platform is
+a Rollout, so the default tooling was effectively blind to it.
+
+`policy/kubernetes/workload_security.rego` resolves the pod template for
+Pods, Deployments, StatefulSets, DaemonSets, Jobs, CronJobs and Rollouts and
+denies: unpinned or `:latest` images, privileged containers, privilege
+escalation, running as root, retained Linux capabilities, writable root
+filesystems, host namespaces, `hostPath` volumes and missing resource
+requests or limits. The Helm chart is rendered with `helm template` and
+checked too. `conftest verify` runs the policy unit tests first, which
+caught a classic Rego pitfall during development: a bare `not` over a missing
+field is undefined, so the rule silently passes. Lookups now use
+`object.get` with explicit defaults.
+
+Kyverno still enforces at admission time; the OPA checks shift the same
+class of failure left to the pull request, before ArgoCD ever sees it.
+
+### What the pipeline found and fixed
+
+| Finding | Fix |
+|---|---|
+| `platform-cli --name ../../../x` wrote files outside `gitops/apps/` (path traversal) | DNS-1123 validation plus a resolved-path check that also blocks symlink escapes |
+| A newline in `--name` or `--image` injected YAML, e.g. retargeting the generated ArgoCD Application to `kube-system` | Strict `fullmatch` validation (Python's `$` also matches before a trailing newline); platform namespaces are refused |
+| `jinja2==3.1.4` had known sandbox-escape advisories | Upgraded to 3.1.6 |
+| Rollouts ran as root with a writable root filesystem and default capabilities | Non-root UID, `readOnlyRootFilesystem`, `drop: [ALL]`, no privilege escalation, `RuntimeDefault` seccomp, service account token not mounted, `emptyDir` for `/tmp`; Helm exposes these as values |
+| Terraform state files were committed to Git | Untracked and ignored; state belongs in a remote backend |
+
+### Supply chain
+
+- Every GitHub Action is pinned to a full commit SHA, and workflow
+  permissions default to `contents: read`.
+- `scripts/install-scanners.sh` downloads pinned scanner releases and verifies
+  hard-coded SHA-256 hashes, so a tampered release asset fails the build.
+- Dependabot keeps the action SHAs, Python packages and Terraform providers
+  current.
+- A CycloneDX SBOM is published as a build artifact on every run.
+
+Run the same checks locally:
+
+```bash
+scripts/install-scanners.sh .bin
+.bin/gitleaks git . --redact
+.bin/conftest verify --policy policy/kubernetes
+.bin/conftest test --policy policy/kubernetes apps/order-service/rollout.yaml
+.bin/trivy config .
+pip install -r cli/requirements.txt -r cli/requirements-dev.txt && pytest -q cli
+```
 
 ## Running it locally
 
@@ -118,7 +189,10 @@ sequence:
 - GitOps as the single source of cluster truth (ArgoCD, App-of-Apps pattern)
 - Metric-gated progressive delivery instead of blind rolling updates
   (Argo Rollouts + Prometheus AnalysisTemplate)
-- Policy-as-code guardrails enforced at admission time (Kyverno)
+- Policy-as-code guardrails enforced at admission time (Kyverno) and shifted
+  left into CI with OPA/Conftest, covering CRDs generic scanners skip
+- A DevSecOps pipeline: secret scanning, SAST, dependency scanning with an
+  SBOM, IaC misconfiguration scanning and SHA-pinned supply chain controls
 - Cost as a first-class platform signal, not an after-the-fact spreadsheet
   (OpenCost)
 - Reducing developer cognitive load with a self-service CLI instead of

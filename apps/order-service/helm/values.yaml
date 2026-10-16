@@ -5,6 +5,22 @@ image:
 replicas: 5
 port: 8080
 
+# Pod hardening. Validated in CI by the OPA policies in policy/kubernetes.
+automountServiceAccountToken: false
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
 resources:
   requests:
     cpu: 100m

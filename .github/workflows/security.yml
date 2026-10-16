@@ -1,0 +1,182 @@
+# Shift-left security gate for the GitOps platform.
+#
+# Every PR and every push to main runs five independent checks. Any HIGH or
+# CRITICAL finding, leaked secret, or policy violation fails the build, so
+# nothing insecure reaches the branch ArgoCD syncs from.
+#
+#   secrets   gitleaks over full Git history
+#   sast      Semgrep (Python + GitHub Actions rules) and CLI security tests
+#   deps      Trivy dependency scan, pip-audit, CycloneDX SBOM
+#   iac       Checkov + Trivy misconfiguration scan (Terraform, Kubernetes, Helm)
+#   policy    OPA/Conftest workload policies, incl. Argo Rollout pod templates
+#
+# Findings are uploaded as SARIF to the repo's Security tab (Code scanning).
+
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1" # weekly re-scan: new CVEs land in unchanged code
+  workflow_dispatch:
+
+# Least privilege by default; jobs that upload SARIF opt in individually.
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SCANNER_DIR: ${{ github.workspace }}/.bin
+
+jobs:
+  secrets:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0 # scan every commit, not just the tip
+          persist-credentials: false
+      - run: scripts/install-scanners.sh "$SCANNER_DIR"
+      - name: Scan history
+        run: |
+          mkdir -p reports
+          "$SCANNER_DIR/gitleaks" git . --redact --no-banner \
+            --report-format sarif --report-path reports/gitleaks.sarif
+      - if: always() && hashFiles('reports/gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: reports/gitleaks.sarif
+          category: gitleaks
+
+  sast:
+    name: SAST (Semgrep) + CLI security tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install semgrep==1.181.0 -r cli/requirements.txt -r cli/requirements-dev.txt
+      - name: Semgrep
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          mkdir -p reports
+          semgrep scan --error \
+            --config p/python --config p/secrets --config p/github-actions \
+            --sarif --output reports/semgrep.sarif .
+      - name: CLI input-validation tests
+        run: pytest -q cli
+      - if: always() && hashFiles('reports/semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+  deps:
+    name: Dependency scanning + SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: scripts/install-scanners.sh "$SCANNER_DIR"
+      - name: Trivy dependency scan
+        run: |
+          mkdir -p reports
+          "$SCANNER_DIR/trivy" fs --scanners vuln --ignore-unfixed \
+            --format sarif --output reports/trivy-deps.sarif .
+          "$SCANNER_DIR/trivy" fs --scanners vuln --ignore-unfixed \
+            --severity HIGH,CRITICAL --exit-code 1 .
+      - name: pip-audit (PyPI advisory database)
+        run: |
+          pip install pip-audit==2.10.1
+          pip-audit --strict -r cli/requirements.txt -r cli/requirements-dev.txt
+      - name: Generate CycloneDX SBOM
+        run: |
+          "$SCANNER_DIR/trivy" fs --format cyclonedx --output reports/sbom.cdx.json .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: reports/sbom.cdx.json
+      - if: always() && hashFiles('reports/trivy-deps.sarif') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: reports/trivy-deps.sarif
+          category: trivy-deps
+
+  iac:
+    name: IaC misconfiguration (Checkov + Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: scripts/install-scanners.sh "$SCANNER_DIR"
+      - name: Checkov
+        run: |
+          pip install checkov==3.3.29
+          mkdir -p reports
+          checkov -d . --quiet --compact \
+            --framework terraform,kubernetes,helm,github_actions,secrets \
+            --output cli --output sarif --output-file-path console,reports
+      - name: Trivy misconfiguration scan
+        if: always()
+        run: |
+          "$SCANNER_DIR/trivy" config --severity HIGH,CRITICAL --exit-code 1 \
+            --format table .
+      - if: always() && hashFiles('reports/results_sarif.sarif') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: reports/results_sarif.sarif
+          category: checkov
+
+  policy:
+    name: OPA policy-as-code (Conftest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: scripts/install-scanners.sh "$SCANNER_DIR"
+      - name: Policy unit tests
+        run: '"$SCANNER_DIR/conftest" verify --policy policy/kubernetes'
+      - name: Render Helm chart
+        run: |
+          mkdir -p reports
+          helm lint apps/order-service/helm
+          helm template order-service apps/order-service/helm > reports/order-service-rendered.yaml
+      - name: Evaluate manifests
+        # Generic scanners skip the Argo Rollout CRD; these policies resolve
+        # its pod template, so canary workloads get the same scrutiny.
+        run: |
+          "$SCANNER_DIR/conftest" test --policy policy/kubernetes --all-namespaces \
+            apps/order-service/rollout.yaml \
+            reports/order-service-rendered.yaml \
+            $(find cli/gitops gitops -name '*.yaml')
